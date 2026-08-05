@@ -1,0 +1,205 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+            args: --bundles deb,appimage
+          - platform: macos
+            os: macos-latest
+            args: --bundles dmg,app
+          - platform: windows
+            os: windows-latest
+            # Windows: portable exe only (zip). Win11 自带 WebView2;
+            # Win10 用户需手动装一次:
+            # https://developer.microsoft.com/microsoft-edge/webview2/
+            args: --no-bundle
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config libudev-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Rust integration tests (PTY loopback)
+        if: matrix.platform == 'linux'
+        working-directory: src-tauri
+        run: cargo test --test integration -- --ignored
+
+      - name: Frontend unit tests
+        run: npm test
+
+      - name: Frontend production build
+        run: npm run build
+
+      - name: Tauri bundle
+        run: npx tauri build ${{ matrix.args }}
+
+      - name: List bundle artifacts
+        if: success()
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          echo "=== Bundle artifacts ==="
+          if [ -d target/release/bundle ]; then
+            find target/release/bundle -type f \
+              \( -name '*.deb' -o -name '*.dmg' -o -name '*.msi' \
+                 -o -name '*.exe' -o -name '*.appimage' \
+                 -o -name '*.app' -o -name '*.pkg' \
+              \) -exec ls -lh {} + || true
+          else
+            echo "(no bundle directory — Windows portable zip uses --no-bundle)"
+          fi
+          echo "=== Release binary ==="
+          ls -lh target/release/last_port* 2>/dev/null || true
+
+      - name: Package Windows portable zip
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -e
+          src="src-tauri/target/release"
+          # portable 目录放 repo root,zip 时平铺 (无子目录嵌套)
+          stage="portable"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          # 主二进制 (找不到就报错)
+          if [ ! -f "$src/last_port.exe" ]; then
+            echo "::error::$src/last_port.exe missing — tauri build --no-bundle did not produce binary"
+            exit 1
+          fi
+          cp "$src/last_port.exe" "$stage/"
+          # 任何 Tauri 运行时 DLL (optional)
+          find "$src" -maxdepth 1 -name '*.dll' -exec cp {} "$stage/" + 2>/dev/null || true
+          # 应用图标 (Windows 资源管理器显示)
+          [ -f "src-tauri/icons/icon.ico" ] && cp "src-tauri/icons/icon.ico" "$stage/"
+          # 用户文档
+          cp "README.md" "$stage/"
+          echo "=== Stage contents ==="
+          ls -lh "$stage/"
+          # PowerShell Compress-Archive 在 Windows runner 上
+          # Git Bash 用 MSYS 路径 (/d/a/...) 但 PowerShell 用 Windows 路径 (D:\a\...)
+          # 必须用 cygpath -w 转换,否则 PowerShell 找不到路径
+          abs_stage_win=$(cygpath -w "$(pwd)/${stage}")
+          zip_path_win=$(cygpath -w "$(pwd)/last_port-windows.zip")
+          echo "PowerShell paths: stage=$abs_stage_win zip=$zip_path_win"
+          # 平铺 zip: 用显式 basename 列表 (不带目录路径) 传给 Compress-Archive。
+          # Get-ChildItem 通过 pipeline 时会保留 FullName 路径,导致 zip 内出现
+          # 目录结构。用 -Path 接数组 + 显式文件名可保证 zip 内只有文件名。
+          powershell -NoProfile -Command "Set-Location -LiteralPath '${abs_stage_win}'; \$files = @('last_port.exe', 'icon.ico', 'README.md'); Compress-Archive -Path \$files -DestinationPath '${zip_path_win}' -Force; if (Test-Path '${zip_path_win}') { Write-Host 'ZIP created' } else { Write-Host 'ZIP MISSING' }"
+          echo "=== Created zip ==="
+          ls -lh last_port-windows.zip
+          echo "=== Zip contents (preview) ==="
+          powershell -NoProfile -Command "Expand-Archive -Path '${zip_path_win}' -DestinationPath 'C:\zip_preview' -Force; Get-ChildItem 'C:\zip_preview' | Format-Table Name, Length; Remove-Item -Recurse -Force 'C:\zip_preview'"
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: last_port-${{ matrix.platform }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.appimage
+            src-tauri/target/release/bundle/**/*.app
+            last_port-windows.zip
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    steps:
+      - name: Download all bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show downloaded artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: last_port ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/**/*.deb
+            artifacts/**/*.dmg
+            artifacts/**/*.msi
+            artifacts/**/*.exe
+            artifacts/**/*.appimage
+            artifacts/**/*.app
+            artifacts/last_port-windows.zip
+
+  ci-status:
+    name: CI status check
+    needs: build
+    runs-on: ubuntu-22.04
+    if: always()
+    steps:
+      - name: Report build matrix status
+        run: |
+          if [ '${{ needs.build.result }}' = 'success' ]; then
+            echo "All builds passed"
+            exit 0
+          else
+            echo "One or more builds failed"
+            exit 1
+          fi
