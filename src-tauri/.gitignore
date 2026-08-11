@@ -1,0 +1,5 @@
+# Tauri 构建产物
+/target/
+
+# 自动生成的 schemas (build 时产出)
+gen/schemas/
