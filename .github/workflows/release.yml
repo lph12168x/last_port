@@ -232,13 +232,26 @@ jobs:
           ls -lhR "$stage"
           echo "=== dist.tar.gz size ==="
           ls -lh dist.tar.gz
+      # Linux/macos upload 单个 dist.tar.gz (含 deb/dmg/appimage/tarball).
+      # Windows 单独走 exe step (下面) — 不要 tar 包, 它的产物是单 .exe
       - name: Upload dist archive
+        if: matrix.platform != 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: last_port-${{ matrix.platform }}-dist
           if-no-files-found: warn
           retention-days: 30
           path: dist.tar.gz
+
+      # Windows 用户: 直接 attach 单 exe. 名字 -dist 让 release 阶段 pattern 统一.
+      - name: Upload Windows dist
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: last_port-${{ matrix.platform }}-dist
+          if-no-files-found: warn
+          retention-days: 30
+          path: src-tauri/target/release/last_port.exe
 
   release:
     name: publish GitHub Release
@@ -253,6 +266,13 @@ jobs:
         with:
           pattern: last_port-*-dist
           path: archives
+
+      # Windows 用户下载单 exe (不再要 zip)
+      - name: Download Windows dist
+        uses: actions/download-artifact@v4
+        with:
+          name: last_port-windows-dist
+          path: release
 
       - name: Extract dist archives
         run: |
@@ -291,21 +311,13 @@ jobs:
           files: |
             release/bundle-*/**
             release/*.tar.gz
-            release/*.zip
             release/*.deb
             release/*.dmg
             release/*.AppImage
             release/*.appimage
             release/*.app/Contents/MacOS/last_port
-            release/**/*.deb
-            release/**/*.dmg
-            release/**/*.msi
-            release/**/*.exe
-            release/**/*.AppImage
-            release/**/*.appimage
-            # 软属性会把 workflow 名加到 path 前缀 (default._last_port...),
-            # 排除之
-            !release/bundle-*/default._*
+            # Windows 用户下载单 exe, 无 zip
+            release/last_port.exe
 
   ci-status:
     name: CI status check

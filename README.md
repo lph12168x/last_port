@@ -154,7 +154,7 @@ last_port/
 ├── scripts/gen_placeholder_icons.py
 ├── README.md
 ├── RELEASE_NOTES.md
-└── LICENSE (MIT)
+└── LICENSE (AGPLv3)
 ```
 
 ## 使用指南
@@ -222,4 +222,4 @@ last_port/
 
 ## License
 
-MIT — 详见 LICENSE 文件
+AGPLv3 — 详见 LICENSE 文件
