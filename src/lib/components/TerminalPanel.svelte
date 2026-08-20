@@ -483,10 +483,32 @@
   }
 
   function handleInputKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      // raw 模式: text='' (字符已 preventDefault), Enter 只发 lineEnding 提交
-      if (rawMode && appState.status.opened && !uiBusy.value) {
+    // --- 默认 raw 模式 (字符级立即发), 兼容 VIM / 交互式编辑器 ---
+    // raw 模式下每个按键立即进入串口 (VIM 完整工作); cooked 模式 (手动关闭)
+    // 字符累积到 text, Enter 触发 send (普通 shell 命令 / 终端输入).
+    if (rawMode && appState.status.opened && !uiBusy.value) {
+      // 字符级立即发: 所有非修饰键 (含 Enter / Escape / Backspace / Tab / Arrow)
+      // 立即写到串口, 不等 line ending.
+      const k = e.key;
+      const isModifier = ['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock'].includes(k);
+      // 单字符键 (含 Enter, Backspace, Tab, Space, Escape) 直接发原生字节
+      // 多字符键 (Arrow*, Home, End, PageUp, PageDown, Insert, F1-F12) 跳过,
+      // 否则会发字面 "ArrowUp" 字符串.
+      if (!isModifier && k.length === 1) {
+        e.preventDefault();
+        // 转 UTF-8 bytes (ASCII 兼容, VIM 用 UTF-8 时中文不乱码)
+        writeData(new TextEncoder().encode(k))
+          .then((n) => {
+            appState.txBytes += n;
+            appState.txFrames += 1;
+            appendLines([mkLine('tx', Date.now(), new TextEncoder().encode(k))]);
+          })
+          .catch((err) => { error = String(err); });
+        return;
+      }
+      // Enter (key="Enter" 长度 5) 单独处理 — 发 lineEnding (CRLF / LF / CR)
+      if (k === 'Enter') {
+        e.preventDefault();
         const bytes = appendLineEnding(new Uint8Array(0), lineEnding);
         writeData(bytes).then((n) => {
           appState.txBytes += n;
@@ -495,83 +517,58 @@
         }).catch((err) => { error = String(err); });
         return;
       }
-      // cooked 模式: text 字段含完整行, send 走
-      send();
-      return;
     }
-    // 字符级立即发 — 模拟 uboot / BIOS "任意键立即入串口" 模式.
-    // input 字符同时进 text (浏览器默认), 我们额外立即 writeData.
-    // 排除纯修饰键 + 已 ctrl/cmd 系列 (避免跟现有 Ctrl+C / Ctrl+L 抢),
-    // 字符级立即发 — 仅在 raw 模式 (rawMode=true) 启用.
-    //   raw 模式 = 不等 Enter, 每个字符立即发到串口. 用于 uboot / 实时协议监控.
-    //   默认 cooked (rawMode=false), 字符进入 input text 字段, Enter 触发 send.
-    // 也排除 Backspace/Delete/Arrow/Home/End/Tab (编辑键, 不该发).
-    if (rawMode && appState.status.opened && !uiBusy.value) {
-      const k = e.key;
-      const isModifier = k === 'Shift' || k === 'Control' || k === 'Alt' || k === 'Meta' || k === 'CapsLock' || k === 'NumLock' || k === 'ScrollLock';
-      const isEditing = k === 'Backspace' || k === 'Delete' || k === 'ArrowUp' || k === 'ArrowDown' || k === 'ArrowLeft' || k === 'ArrowRight' || k === 'Home' || k === 'End' || k === 'Tab' || k === 'PageUp' || k === 'PageDown' || k === 'Insert' || k === 'Escape';
-      if (!isModifier && !isEditing && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (k.length === 1) {
-          e.preventDefault();
-          writeData(new TextEncoder().encode(k))
-            .then((n) => {
-              appState.txBytes += n;
-              appState.txFrames += 1;
-              appendLines([mkLine('tx', Date.now(), new TextEncoder().encode(k))]);
-              rememberLastTxText(k);
-            })
-            .catch((err) => { error = String(err); });
-          return;
+
+    // --- cooked 模式: 字符进 text 字段, Enter 走 send ---
+    if (!rawMode) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+        return;
+      }
+      if (history.length === 0) return;
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const idx = historyIndex < 0 ? 0 : Math.min(historyIndex + 1, history.length - 1);
+        historyIndex = idx;
+        applyHistory(idx);
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const idx = historyIndex - 1;
+        if (idx < 0) {
+          historyIndex = -1;
+          text = '';
+        } else {
+          historyIndex = idx;
+          applyHistory(idx);
         }
       }
+      return;
     }
-    // Ctrl+C: 发 SIGINT (0x03)
-    if (e.key === 'c' && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      if (!appState.status.opened) return;
-      const sig = new Uint8Array([0x03]);
-      writeData(sig).then(
-        (n) => {
+
+    // --- raw 模式下的快捷键: 字体 / 清屏 / Ctrl+C SIGINT ---
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+      // Ctrl+C: SIGINT
+      if (e.key === 'c' || e.key === 'C') {
+        e.preventDefault();
+        const sig = new Uint8Array([0x03]);
+        writeData(sig).then((n) => {
           appState.txBytes += n;
           appState.txFrames += 1;
           appendLines([mkLine('tx', Date.now(), sig)]);
-          rememberLastTxText(String.fromCharCode(0x03));
-          text = '';
-          historyIndex = -1;
-          inputRef?.focus();
-        },
-        (err) => { error = String(err); inputRef?.focus(); }
-      );
-      return;
-    }
-    // Ctrl+L: 清屏
-    if (e.key === 'l' && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      clearAll();
-      return;
-    }
-    // Ctrl+ 字体大小: +/-/0
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+        }).catch((err) => { error = String(err); });
+        return;
+      }
+      // Ctrl+L: 清屏
+      if (e.key === 'l' || e.key === 'L') {
+        e.preventDefault();
+        clearAll();
+        return;
+      }
+      // 字体调节: +/-/0
       if (e.key === '=' || e.key === '+') { e.preventDefault(); bumpFont(+FONT_STEP); return; }
       if (e.key === '-' || e.key === '_') { e.preventDefault(); bumpFont(-FONT_STEP); return; }
       if (e.key === '0')                   { e.preventDefault(); fontPx = FONT_DEFAULT; return; }
-    }
-    if (history.length === 0) return;
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      const idx = historyIndex < 0 ? 0 : Math.min(historyIndex + 1, history.length - 1);
-      historyIndex = idx;
-      applyHistory(idx);
-    } else if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      const idx = historyIndex - 1;
-      if (idx < 0) {
-        historyIndex = -1;
-        text = '';
-      } else {
-        historyIndex = idx;
-        applyHistory(idx);
-      }
     }
   }
 
